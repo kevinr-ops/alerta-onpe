@@ -34,11 +34,21 @@ def sin_tildes(t):
     return "".join(c for c in unicodedata.normalize("NFD", t or "") if unicodedata.category(c) != "Mn").upper()
 
 
+from curl_cffi import requests as cr  # se hace pasar por Chrome real
+
+SESION = cr.Session(impersonate="chrome")
+SESION.get(PORTAL, timeout=30)  # visita la página primero, como una persona
+
+
 def http(url, data=None):
-    body = json.dumps(data).encode() if data is not None else None
-    req = urllib.request.Request(url, data=body, headers=HEADERS, method="POST" if body else "GET")
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read().decode("utf-8"))
+    h = {k: v for k, v in HEADERS.items() if k != "User-Agent"}
+    if data is not None:
+        r = SESION.post(url, json=data, headers=h, timeout=30)
+    else:
+        r = SESION.get(url, headers=h, timeout=30)
+    if r.status_code != 200:
+        sys.exit(f"ONPE respondió {r.status_code} en {url}")
+    return r.json()
 
 
 def id_departamento():
