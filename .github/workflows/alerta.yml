@@ -24,19 +24,17 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Instalar dependencias
-        run: pip install curl_cffi
-
       - name: Revisar convocatorias
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          PALABRAS: "COORDINADOR"
-          DEPARTAMENTO: "LORETO"
+          PALABRAS: "COORDINADOR"        # varias: "COORDINADOR,ASISTENTE"
+          DEPARTAMENTO: "LORETO"         # vacío = todo el Perú
+          ENTIDAD: ""                    # ej: "PROCESOS ELECTORALES" = solo ONPE; vacío = cualquier entidad
         run: python alerta.py
 
-      - name: Instalar dependencias
-        run: pip install curl_cffi
+      - name: Guardar lo ya avisado
+        run: |
           git config user.name "alerta-bot"
           git config user.email "alerta-bot@users.noreply.github.com"
           git add vistos.json
@@ -47,3 +45,4 @@ jobs:
             git pull --rebase
             git push
           fi
+
