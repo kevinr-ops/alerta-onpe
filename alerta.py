@@ -1,85 +1,139 @@
 """
-Alerta ONPE -> Telegram
-Revisa las ofertas del portal SIGLOC de ONPE (reclutamiento.onpe.gob.pe)
-y avisa por Telegram cuando aparece una nueva que coincida con el filtro.
+Alerta de convocatorias -> Telegram
+Revisa las ofertas publicadas en Talento Perú (SERVIR), el portal donde las
+entidades públicas publican sus convocatorias, y avisa por Telegram cuando
+aparece una nueva que coincida con el filtro.
+
+Solo usa la librería estándar de Python: no hace falta instalar nada.
 """
+import html
+import http.cookiejar
 import json
 import os
+import re
 import sys
 import unicodedata
+import urllib.parse
 import urllib.request
 
-API = "https://reclutamiento.onpe.gob.pe/sigloc-backend/v1/api"
-PORTAL = "https://reclutamiento.onpe.gob.pe/convocatorias"
+sys.stdout.reconfigure(encoding="utf-8")  # para que los emojis no fallen en la consola de Windows
+
+URL = "https://app.servir.gob.pe/DifusionOfertasExterno/faces/consultas/ofertas_laborales.xhtml"
 ESTADO = "vistos.json"
 
-TOKEN = os.environ["TELEGRAM_TOKEN"]
-CHAT_IDS = [c.strip() for c in os.environ["TELEGRAM_CHAT_ID"].split(",") if c.strip()]
-# Palabras clave separadas por coma (sin tildes da igual). Ej: "COORDINADOR"
+# Con DRY_RUN=1 solo imprime en pantalla, sin enviar a Telegram (para probar en tu PC)
+DRY_RUN = os.getenv("DRY_RUN") == "1"
+TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+CHAT_IDS = [c.strip() for c in os.getenv("TELEGRAM_CHAT_ID", "").split(",") if c.strip()]
+# Palabras del puesto, separadas por coma. Ej: "COORDINADOR,ASISTENTE"
 PALABRAS = [p.strip() for p in os.getenv("PALABRAS", "COORDINADOR").split(",") if p.strip()]
-# Departamento, ej: "SAN MARTIN". Vacío = todo el Perú
+# Departamento, ej: "LORETO". Vacío = todo el Perú
 DEPARTAMENTO = os.getenv("DEPARTAMENTO", "").strip()
+# Parte del nombre de la entidad, ej: "PROCESOS ELECTORALES" para solo ONPE. Vacío = cualquiera
+ENTIDAD = os.getenv("ENTIDAD", "").strip()
 
-HEADERS = {
-    "Content-Type": "application/json",
-    "Accept": "application/json, text/plain, */*",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/130.0 Safari/537.36",
-    "Origin": "https://reclutamiento.onpe.gob.pe",
-    "Referer": PORTAL,
+if not DRY_RUN and (not TOKEN or not CHAT_IDS):
+    sys.exit("Faltan los secrets TELEGRAM_TOKEN o TELEGRAM_CHAT_ID.")
+
+# Códigos de departamento que usa el portal de SERVIR
+DEPARTAMENTOS = {
+    "AMAZONAS": "01", "ANCASH": "02", "APURIMAC": "03", "AREQUIPA": "04", "AYACUCHO": "05",
+    "CAJAMARCA": "06", "CALLAO": "07", "CUSCO": "08", "HUANCAVELICA": "09", "HUANUCO": "10",
+    "ICA": "11", "JUNIN": "12", "LA LIBERTAD": "13", "LAMBAYEQUE": "14", "LIMA": "15",
+    "LORETO": "16", "MADRE DE DIOS": "17", "MOQUEGUA": "18", "PASCO": "19", "PIURA": "20",
+    "PUNO": "21", "SAN MARTIN": "22", "TACNA": "23", "TUMBES": "24", "UCAYALI": "25",
 }
+
+F = "frmLstOfertsLabo"
 
 
 def sin_tildes(t):
-    return "".join(c for c in unicodedata.normalize("NFD", t or "") if unicodedata.category(c) != "Mn").upper()
+    return "".join(c for c in unicodedata.normalize("NFD", t or "")
+                   if unicodedata.category(c) != "Mn").upper()
 
 
-from curl_cffi import requests as cr  # se hace pasar por Chrome real
-
-SESION = cr.Session(impersonate="chrome")
-SESION.get(PORTAL, timeout=30)  # visita la página primero, como una persona
+def limpio(t):
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", t))).strip()
 
 
-def http(url, data=None):
-    h = {k: v for k, v in HEADERS.items() if k != "User-Agent"}
-    if data is not None:
-        r = SESION.post(url, json=data, headers=h, timeout=30)
-    else:
-        r = SESION.get(url, headers=h, timeout=30)
-    if r.status_code != 200:
-        sys.exit(f"ONPE respondió {r.status_code} en {url}")
-    return r.json()
+class Portal:
+    def __init__(self):
+        self.op = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        self.op.addheaders = [("User-Agent", "alerta-convocatorias/1.0 (uso personal)")]
+        self.html = ""
 
+    def _pedir(self, datos=None):
+        cuerpo = urllib.parse.urlencode(datos).encode() if datos else None
+        with self.op.open(URL, cuerpo, timeout=30) as r:
+            if r.status != 200:
+                sys.exit(f"SERVIR respondió {r.status}")
+            self.html = r.read().decode("utf-8", errors="replace")
 
-def id_departamento():
-    if not DEPARTAMENTO:
-        return 0
-    for d in http(f"{API}/ubigeo/padre/1").get("data") or []:
-        if sin_tildes(d["nombre"]) == sin_tildes(DEPARTAMENTO):
-            return d["id"]
-    sys.exit(f"No encontré el departamento '{DEPARTAMENTO}'. Revisa cómo lo escribiste.")
+    def _viewstate(self):
+        m = re.search(r'name="javax.faces.ViewState"[^>]*value="([^"]+)"', self.html)
+        if not m:
+            sys.exit("La página de SERVIR cambió: no encontré el formulario.")
+        return m.group(1)
 
+    def _boton(self, texto):
+        """Devuelve el id del botón con ese texto (Buscar, Sig.), o None si está desactivado."""
+        for m in re.finditer(r'<button id="([^"]+)"[^>]*>(.*?)</button>', self.html, re.S):
+            etiqueta = limpio(m.group(2))
+            titulo = re.search(r'title="([^"]*)"', m.group(0))
+            if texto in (etiqueta, titulo.group(1) if titulo else ""):
+                return None if "disabled" in m.group(0)[:m.group(0).find(">")] else m.group(1)
+        return None
 
-def ofertas(id_dep):
-    resultado = []
-    for tipo in (1, 2):  # 1 = Locación de servicios, 2 = Concursos públicos
-        pagina = 0
-        while True:
-            r = http(f"{API}/convocatoria/lista", {
-                "tipoConvocatoria": tipo, "idRubro": 0, "idDepartamento": id_dep,
-                "verConcluidas": False, "palabraClave": None, "idOdp": None,
-                "idLugarEjecucion": 0, "fechaPublicacion": {"start": None, "end": None},
-                "page": pagina, "pageSize": 50,
-            })
-            p = (r.get("data") or {}).get("convocatoriasPage") or {}
-            resultado += p.get("rows") or []
-            pagina += 1
-            if pagina >= (p.get("totalPages") or 0):
+    def _ofertas_de_pagina(self):
+        res = []
+        for tarjeta in self.html.split("<label>")[1:]:
+            if "idPnlRepeatPuestos" not in tarjeta:
+                continue
+            o = {"puesto": limpio(tarjeta.split("</label>")[0])}
+            m = re.search(r"<b>(.*?)</b>", tarjeta, re.S)
+            o["entidad"] = limpio(m.group(1)) if m else ""
+            for clave, etiqueta in [("ubicacion", "Ubicaci"), ("numero", "mero de Convocatoria"),
+                                    ("vacantes", "Cantidad de Vacantes"), ("sueldo", "Remuneraci"),
+                                    ("inicio", "Fecha Inicio"), ("fin", "Fecha Fin")]:
+                m = re.search(etiqueta + r".*?</span>.*?<span[^>]*>(.*?)</span>", tarjeta, re.S)
+                o[clave] = limpio(m.group(1)) if m else ""
+            res.append(o)
+        return res
+
+    def buscar(self, puesto, cod_dep):
+        self._pedir()  # abre la página para obtener el formulario
+        form = {
+            F: F, f"{F}:modalidadAcceso": "03", f"{F}:txtPerfil": "",
+            f"{F}:cboDep_input": cod_dep, f"{F}:cboDep_focus": "",
+            f"{F}:txtPuesto": puesto, f"{F}:autocompletar_input": "",
+            f"{F}:autocompletar_hinput": "", f"{F}:txtNroConv": "",
+        }
+        boton = self._boton("Buscar")
+        if not boton:
+            sys.exit("La página de SERVIR cambió: no encontré el botón Buscar.")
+        self._pedir({**form, boton: "", "javax.faces.ViewState": self._viewstate()})
+        ofertas = self._ofertas_de_pagina()
+        for _ in range(30):  # como máximo 30 páginas (300 ofertas) por palabra
+            sig = self._boton("Sig.")
+            if not sig:
                 break
-    return resultado
+            self._pedir({**form, sig: "", "javax.faces.ViewState": self._viewstate()})
+            nuevas = self._ofertas_de_pagina()
+            if not nuevas:
+                break
+            ofertas += nuevas
+        return ofertas
+
+
+def clave(o):
+    return f"{o['entidad']}|{o['numero']}|{o['puesto']}"
 
 
 def telegram(texto):
+    if DRY_RUN:
+        print("---- (no enviado, DRY_RUN) ----\n" + texto)
+        return
     for chat in CHAT_IDS:
         req = urllib.request.Request(
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
@@ -89,35 +143,48 @@ def telegram(texto):
         urllib.request.urlopen(req, timeout=30)
 
 
-def main():
-    vistos = set()
-    primera_vez = not os.path.exists(ESTADO)
-    if not primera_vez:
-        vistos = set(json.load(open(ESTADO)))
+def esc(t):
+    return html.escape(t or "?", quote=False)
 
-    id_dep = id_departamento()
-    todas = ofertas(id_dep)
-    claves = [sin_tildes(p) for p in PALABRAS]
-    filtradas = [o for o in todas if any(k in sin_tildes(o.get("denominacion")) for k in claves)]
-    nuevas = [o for o in filtradas if str(o["idPerfil"]) not in vistos]
+
+def main():
+    cod_dep = "0"
+    if DEPARTAMENTO:
+        cod_dep = DEPARTAMENTOS.get(sin_tildes(DEPARTAMENTO))
+        if not cod_dep:
+            sys.exit(f"No conozco el departamento '{DEPARTAMENTO}'. Opciones: {', '.join(DEPARTAMENTOS)}")
+
+    portal = Portal()
+    encontradas = {}
+    for palabra in PALABRAS:
+        for o in portal.buscar(palabra, cod_dep):
+            if ENTIDAD and sin_tildes(ENTIDAD) not in sin_tildes(o["entidad"]):
+                continue
+            encontradas[clave(o)] = o
+
+    primera_vez = not os.path.exists(ESTADO)
+    vistos = set() if primera_vez else set(json.load(open(ESTADO, encoding="utf-8")))
+    nuevas = [o for k, o in encontradas.items() if k not in vistos]
 
     zona = DEPARTAMENTO.upper() or "todo el Perú"
-    print(f"{len(todas)} ofertas vigentes, {len(filtradas)} coinciden, {len(nuevas)} nuevas ({zona})")
+    filtro = f"{', '.join(PALABRAS)}" + (f" en {ENTIDAD}" if ENTIDAD else "")
+    print(f"{len(encontradas)} coinciden, {len(nuevas)} nuevas ({filtro} / {zona})")
 
     if primera_vez:
-        lista = "\n".join(f"• {o['denominacion']} — S/ {o.get('montoSoles') or '?'}" for o in filtradas) \
-            or "Por ahora no hay ninguna vigente."
-        telegram(f"✅ <b>Alerta ONPE activada</b>\nZona: {zona}\nBusco: {', '.join(PALABRAS)}\n\n"
-                 f"Vigentes ahora:\n{lista}\n\nTe aviso apenas salga una nueva.\n{PORTAL}")
+        lista = "\n".join(f"• {esc(o['puesto'])} — {esc(o['entidad'])} — {esc(o['sueldo'])}"
+                          for o in encontradas.values()) or "Por ahora no hay ninguna vigente."
+        telegram(f"✅ <b>Alerta de convocatorias activada</b>\nZona: {esc(zona)}\nBusco: {esc(filtro)}\n\n"
+                 f"Vigentes ahora:\n{lista[:3500]}\n\nTe aviso apenas salga una nueva.")
     else:
         for o in nuevas:
-            fecha = (o.get("fechaPublicacion") or "")[:16].replace("T", " ")
-            rubro = ", ".join(r["descripcion"] for r in o.get("lsRubros") or [])
-            telegram(f"🚨 <b>NUEVA CONVOCATORIA ONPE</b>\n\n<b>{o['denominacion']}</b>\n"
-                     f"💰 S/ {o.get('montoSoles') or '?'}\n📂 {rubro}\n🗓 Publicada: {fecha}\n📍 {zona}\n\n"
-                     f"Postula aquí (revisa las bases y el plazo):\n{PORTAL}")
+            telegram(f"🚨 <b>NUEVA CONVOCATORIA</b>\n\n<b>{esc(o['puesto'])}</b>\n"
+                     f"🏛 {esc(o['entidad'])}\n💰 {esc(o['sueldo'])}\n👥 Vacantes: {esc(o['vacantes'])}\n"
+                     f"📍 {esc(o['ubicacion'])}\n🗓 {esc(o['inicio'])} al {esc(o['fin'])}\n"
+                     f"🔖 {esc(o['numero'])}\n\n"
+                     f"Búscala en Talento Perú (revisa las bases y el plazo):\n{URL}")
 
-    json.dump(sorted(vistos | {str(o["idPerfil"]) for o in filtradas}), open(ESTADO, "w"), indent=0)
+    json.dump(sorted(vistos | set(encontradas)), open(ESTADO, "w", encoding="utf-8"),
+              ensure_ascii=False, indent=0)
 
 
 if __name__ == "__main__":
